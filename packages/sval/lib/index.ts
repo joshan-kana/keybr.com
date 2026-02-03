@@ -19,6 +19,11 @@ export async function getKeymap() {
       usagePage: 0xff60,
       usage: 0x61,
     },
+    {
+      // viable-qmk (Client ID protocol) HID interface
+      usagePage: 0xff61,
+      usage: 0x62,
+    },
   ]);
   await Vial.getKeyboardInfo(kbinfo);
   await kb.getKeyMap(kbinfo);

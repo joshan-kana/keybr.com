@@ -5,6 +5,7 @@
 //  Raw information and interaction with USBHID.
 //
 ////////////////////////////////////
+import { CLIENT_ID_CONSTANTS,clientIdWrapper } from "./client_id_wrapper.js";
 import { unpack } from "./util.js";
 
 // Playback: Handy for when I'm just tweaking UI stuff.
@@ -81,8 +82,8 @@ export const USB = {
   // This will be set to the opened device.
   device: undefined,
 
-  // This is updated for every send()
-  listener: (data, ev) => {},
+  // Enable Client ID protocol (default: true for viable-qmk support)
+  useClientIdProtocol: true,
 
   open: async function (filters) {
     if (SETTINGS.playback) {
@@ -93,23 +94,40 @@ export const USB = {
         filters: filters,
       });
 
-      if (devices.length !== 1) return false;
+      if (devices.length === 0) {
+        console.log("No device selected");
+        return false;
+      }
+
+      if (devices.length !== 1) {
+        console.log("Multiple devices selected, using first one");
+      }
 
       USB.device = devices[0];
-      const opened = await USB.device.open();
 
-      await USB.initListener();
+      if (!USB.device.opened) {
+        await USB.device.open();
+      }
+
+      // Bootstrap Client ID protocol if enabled
+      if (USB.useClientIdProtocol) {
+        try {
+          await clientIdWrapper.bootstrap(USB.device);
+          console.log(
+            "Client ID protocol enabled - ID: 0x" +
+              clientIdWrapper.clientId.toString(16),
+          );
+        } catch (error) {
+          console.warn(
+            "Client ID bootstrap failed, falling back to legacy mode:",
+            error.message,
+          );
+          USB.useClientIdProtocol = false;
+        }
+      }
 
       return true;
     }
-  },
-
-  initListener: () => {
-    USB.device.addEventListener("inputreport", (ev) => {
-      if (USB.listener) {
-        USB.listener(ev.data.buffer, ev);
-      }
-    });
   },
 
   formatResponse: (data, flags) => {
@@ -139,6 +157,16 @@ export const USB = {
         cls = Uint32Array;
         bytes = 4;
       }
+      // Wrapped Client ID responses are often 26 bytes. TypedArray constructors
+      // require the buffer length to be a multiple of the element size.
+      // Truncate any trailing partial element to avoid RangeError.
+      if (data instanceof ArrayBuffer && bytes > 1) {
+        const remainder = data.byteLength % bytes;
+        if (remainder !== 0) {
+          data = data.slice(0, data.byteLength - remainder);
+        }
+      }
+
       data = new cls(data);
       if (flags.bigendian) {
         data = convArrayEndian(data, bytes);
@@ -163,41 +191,137 @@ export const USB = {
     return data;
   },
 
-  send: (cmd, args, flags) => {
-    // Format what we're sending.
-    // cmd must be one byte. Browser will throw the error
-    // anyway.
-    let cmdargs = [cmd];
-    if (args) {
-      cmdargs = [cmd, ...args];
+  send: function (cmd, args, flags) {
+    return this._send(cmd, args, flags, 0);
+  },
+
+  _send: (cmd, args, flags, retryCount) => {
+    if (!USB.device) {
+      return Promise.reject(
+        new Error("USB device not opened. Call USB.open() first."),
+      );
     }
-    for (let i = cmdargs.length; i < MSG_LEN; i++) {
-      cmdargs.push(0);
+
+    // Format what we're sending.
+    let cmdargs = [cmd, ...(args || [])];
+
+    // Determine protocol for wrapping
+    let protocol = null;
+    let wrappedPayload = null;
+    if (USB.useClientIdProtocol && clientIdWrapper.isEnabled()) {
+      // viable-qmk expects most host traffic to go through the Client ID wrapper.
+      // Treat everything as VIA unless explicitly sending a Viable-protocol frame.
+      if (cmd === CLIENT_ID_CONSTANTS.PROTOCOL_VIABLE) {
+        protocol = CLIENT_ID_CONSTANTS.PROTOCOL_VIABLE;
+        wrappedPayload = args || [];
+      } else {
+        protocol = CLIENT_ID_CONSTANTS.PROTOCOL_VIA;
+        wrappedPayload = cmdargs;
+      }
     }
 
     if (SETTINGS.playback) {
       const data = playback(cmdargs);
       const ret = USB.formatResponse(data, flags);
-      const respromise = new Promise((res, rej) => {
-        res(ret);
-      });
-      return respromise;
+      return Promise.resolve(ret);
     }
 
-    // Callback for when we get a response.
-    const cbpromise = new Promise((res, rej) => {
-      USB.listener = (data, ev) => {
-        if (SETTINGS.record && !SETTINGS.playback) {
-          recordPlayback(cmdargs, data);
+    return new Promise((resolve, reject) => {
+      const responseListener = (event) => {
+        if (event.reportId !== 0) {
+          return;
         }
-        const ret = USB.formatResponse(data, flags);
-        res(ret);
-      };
-    });
-    // Send update and respond to callback.
-    const sendpromise = USB.device.sendReport(0, new Uint8Array(cmdargs));
-    sendpromise.then(cbpromise);
 
-    return cbpromise;
+        let responseData = event.data.buffer;
+
+        if (protocol != null && clientIdWrapper.isEnabled()) {
+          let unwrapped;
+          try {
+            unwrapped = clientIdWrapper.unwrapResponse(responseData);
+          } catch (e) {
+            clearTimeout(timeout);
+            USB.device.removeEventListener("inputreport", responseListener);
+            reject(e);
+            return;
+          }
+
+          if (!unwrapped.valid) {
+            if (unwrapped.errorType === "wrong_client") {
+              return;
+            }
+
+            if (unwrapped.errorType === "expired") {
+              clearTimeout(timeout);
+              USB.device.removeEventListener("inputreport", responseListener);
+              console.log("Client ID expired, re-bootstrapping...");
+              clientIdWrapper
+                .bootstrap(USB.device)
+                .then(() => USB._send(cmd, args, flags, 0))
+                .then(resolve)
+                .catch(reject);
+              return;
+            }
+
+            clearTimeout(timeout);
+            USB.device.removeEventListener("inputreport", responseListener);
+            reject(
+              new Error(
+                unwrapped.error || "Wrapped response validation failed",
+              ),
+            );
+            return;
+          }
+
+          // Valid wrapped response: pass only the inner payload onwards.
+          {
+            const payloadBytes = new Uint8Array(unwrapped.payload);
+            const alignedBuffer = new ArrayBuffer(payloadBytes.byteLength);
+            new Uint8Array(alignedBuffer).set(payloadBytes);
+            responseData = alignedBuffer;
+          }
+        }
+
+        clearTimeout(timeout);
+        USB.device.removeEventListener("inputreport", responseListener);
+        const formattedResponse = USB.formatResponse(responseData, flags);
+        resolve(formattedResponse);
+      };
+
+      USB.device.addEventListener("inputreport", responseListener);
+
+      const timeout = setTimeout(() => {
+        USB.device.removeEventListener("inputreport", responseListener);
+        reject(new Error("HID response timeout"));
+      }, 3000);
+
+      const sendCommand = () => {
+        let dataToSend;
+        if (protocol != null) {
+          if (clientIdWrapper.needsRenewal()) {
+            console.log("Client ID near expiry, renewing...");
+            return clientIdWrapper.bootstrap(USB.device).then(sendCommand);
+          }
+          dataToSend = clientIdWrapper.wrapCommand(
+            protocol,
+            wrappedPayload || [],
+          );
+        } else {
+          dataToSend = new Uint8Array(MSG_LEN);
+          dataToSend.set(cmdargs);
+        }
+
+        if (SETTINGS.record && !SETTINGS.playback) {
+          recordPlayback(cmdargs, dataToSend);
+        }
+
+        USB.device.sendReport(0, dataToSend).catch((err) => {
+          clearTimeout(timeout);
+          USB.device.removeEventListener("inputreport", responseListener);
+          reject(err);
+        });
+      };
+
+      sendCommand();
+    });
   },
 };

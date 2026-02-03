@@ -14,6 +14,17 @@
 
 import { XzReadableStream } from "xzwasm";
 
+let lzmaInstancePromise;
+
+async function getLzmaInstance() {
+  if (!lzmaInstancePromise) {
+    lzmaInstancePromise = import("lzma-web").then(
+      ({ default: LZMA }) => new LZMA(),
+    );
+  }
+  return lzmaInstancePromise;
+}
+
 // QoL: This export function creates a constant container / enum that will throw an
 // error if anything is requested that is undefined. For example: STATE.open vs
 // STATE.okay - the latter will error instead of returning undefined.
@@ -213,11 +224,84 @@ export function lockValue(val) {
 }
 
 // A wrapper around xzwasm's decompression.
-export function decompress(buffer) {
-  const blob = new Blob([buffer]);
-  const xrs = new XzReadableStream(blob.stream());
-  const resp = new Response(xrs);
-  return resp.text();
+export async function decompress(buffer) {
+  const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+
+  // XZ magic header: FD 37 7A 58 5A 00
+  const isXz =
+    bytes.byteLength >= 6 &&
+    bytes[0] === 0xfd &&
+    bytes[1] === 0x37 &&
+    bytes[2] === 0x7a &&
+    bytes[3] === 0x58 &&
+    bytes[4] === 0x5a &&
+    bytes[5] === 0x00;
+
+  // LZMA "alone" header: properties byte (commonly 0x5d) + dict size + uncompressed size.
+  // viable-qmk uses python's lzma.FORMAT_ALONE.
+  const isLzmaAlone = bytes.byteLength >= 13 && bytes[0] === 0x5d;
+
+  const wrapError = (kind, err) => {
+    const msg = err instanceof Error ? err.message : String(err);
+    const stack = err instanceof Error ? err.stack : undefined;
+    const wrapped = new Error(`Definition decompress (${kind}) failed: ${msg}`);
+    if (stack) wrapped.stack = `${wrapped.stack}\nCaused by:\n${stack}`;
+    throw wrapped;
+  };
+
+  if (isXz) {
+    try {
+      const blob = new Blob([bytes]);
+      const xrs = new XzReadableStream(blob.stream());
+      const reader = xrs.getReader();
+
+      const chunks = [];
+      let total = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          chunks.push(value);
+          total += value.byteLength;
+        }
+      }
+
+      const out = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        out.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      return new TextDecoder("utf-8").decode(out);
+    } catch (err) {
+      wrapError("xz", err);
+    }
+  }
+
+  if (isLzmaAlone) {
+    try {
+      const lzma = await getLzmaInstance();
+
+      // LZMA-JS / lzma-web expects a signed byte array.
+      const input = Array.from(
+        new Int8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength),
+      );
+
+      const out = await lzma.decompress(input);
+      if (typeof out === "string") {
+        return out;
+      }
+
+      const outBytes = out instanceof Uint8Array ? out : new Uint8Array(out);
+      return new TextDecoder("utf-8").decode(outBytes);
+    } catch (err) {
+      wrapError("lzma", err);
+    }
+  }
+
+  throw new Error(
+    "Unknown compressed definition format (expected XZ or LZMA-alone).",
+  );
 }
 
 ////////////////////////////////////

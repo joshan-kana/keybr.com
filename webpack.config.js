@@ -179,7 +179,7 @@ export default [
     output: {
       path: join(import.meta.dirname, "root", "public", "assets"),
       clean: true,
-      publicPath: "/keybr.com/assets/",
+      publicPath: "auto",
       filename: `${filename}.js`,
       chunkFilename: `${chunkFilename}.js`,
       assetModuleFilename: `${assetModuleFilename}[ext]`,
@@ -189,6 +189,10 @@ export default [
         rule_ts(),
         rule_js(),
         rule_less(true),
+        {
+          test: /\.wasm$/,
+          type: "asset/resource",
+        },
         {
           test: /\/assets\//,
           type: "asset/resource",

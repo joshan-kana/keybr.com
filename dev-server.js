@@ -9,6 +9,7 @@ const MIME_TYPES = {
   html: "text/html; charset=UTF-8",
   js: "text/javascript",
   css: "text/css",
+  wasm: "application/wasm",
   png: "image/png",
   jpg: "image/jpeg",
   gif: "image/gif",

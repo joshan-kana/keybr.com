@@ -7,6 +7,7 @@
 //  Pull together all Vial's .js files.
 //
 ////////////////////////////////////
+import { CLIENT_ID_CONSTANTS,clientIdWrapper } from "../client_id_wrapper.js";
 import { BE16, BE32, LE16, LE32, MSG_LEN, USB } from "../usbhid.js";
 import { decompress, lockValue } from "../util.js";
 import { kb as keyboard } from "./kb.js";
@@ -83,7 +84,11 @@ export const VialUSB = lockValue({
     // This is for Via messages that expect:
     //   send(cmd_get_buffer, [offset, size])
     let offset = 0;
-    const chunksize = 28;
+
+    // When using Client ID wrapper: 32 byte frame - 6 byte wrapper - 4 byte cmd overhead = 22 bytes
+    // Legacy mode: 32 byte frame - 4 byte cmd overhead = 28 bytes
+    const chunksize =
+      USB.useClientIdProtocol && clientIdWrapper.isEnabled() ? 22 : 28;
     const alldata = [];
     if (!opts.bytes) opts.bytes = 1;
 
@@ -115,7 +120,11 @@ export const VialUSB = lockValue({
     // This is for Via messages that expect:
     //   send(cmd_get_buffer, [offset, size])
     let offset = 0;
-    const chunksize = 28;
+
+    // When using Client ID wrapper: 32 byte frame - 6 byte wrapper - 4 byte cmd overhead = 22 bytes
+    // Legacy mode: 32 byte frame - 4 byte cmd overhead = 28 bytes
+    const chunksize =
+      USB.useClientIdProtocol && clientIdWrapper.isEnabled() ? 22 : 28;
     const alldata = [];
 
     while (offset < size) {
@@ -200,38 +209,107 @@ export const Vial = {
     kbinfo.vial_proto = vial_kbid[0];
     kbinfo.kbid = vial_kbid[1].toString();
 
-    // Vial KB info is via an xz-compressed JSON blob. Fetched 32 bytes
-    // at a time.
-    //
-    // This mostly contains our layout visualizer for the GUI.
-    const payload_size = await VialUSB.sendVial(VialUSB.CMD_VIAL_GET_SIZE, [], {
-      uint32: true,
-      index: 0,
-    });
+    // Keyboard definition is a compressed JSON blob used for the layout visualizer.
+    // In legacy Vial, it's fetched in 32-byte blocks. Under viable-qmk Client ID wrapper,
+    // the VIA payload capacity is only 26 bytes, so Vial's 32-byte block fetch gets truncated.
+    // viable-qmk provides an alternate "Viable" protocol definition API with smaller chunking.
 
-    let block = 0;
-    let sz = payload_size;
-    let payload = new ArrayBuffer(payload_size);
-    let pdv = new DataView(payload);
-    let offset = 0;
-    while (sz > 0) {
-      let data = await VialUSB.sendVial(
-        VialUSB.CMD_VIAL_GET_DEFINITION,
-        [...LE32(block)],
-        { uint8: true },
+    const fetchDefinitionVial = async () => {
+      const payload_size = await VialUSB.sendVial(
+        VialUSB.CMD_VIAL_GET_SIZE,
+        [],
+        {
+          uint32: true,
+          index: 0,
+        },
       );
 
-      for (let i = 0; i < MSG_LEN && offset < payload_size; i++) {
-        pdv.setInt8(offset, data[i]);
-        offset += 1;
-      }
-      sz = sz - MSG_LEN;
-      block += 1;
-    }
-    // Decompress and deJSONify
-    const up = [...new Int8Array(payload)];
+      const block_size =
+        USB.useClientIdProtocol && clientIdWrapper.isEnabled()
+          ? clientIdWrapper.getMaxPayloadSize()
+          : MSG_LEN;
 
-    payload = JSON.parse(await decompress(new Uint8Array(up).buffer));
+      let block = 0;
+      let sz = payload_size;
+      let payload = new ArrayBuffer(payload_size);
+      let pdv = new DataView(payload);
+      let offset = 0;
+      while (sz > 0) {
+        let data = await VialUSB.sendVial(
+          VialUSB.CMD_VIAL_GET_DEFINITION,
+          [...LE32(block)],
+          { uint8: true },
+        );
+
+        for (let i = 0; i < block_size && offset < payload_size; i++) {
+          pdv.setInt8(offset, data[i]);
+          offset += 1;
+        }
+        sz = sz - block_size;
+        block += 1;
+      }
+
+      const up = [...new Int8Array(payload)];
+      return new Uint8Array(up).buffer;
+    };
+
+    const fetchDefinitionViable = async () => {
+      const sizeResp = await VialUSB.send(
+        CLIENT_ID_CONSTANTS.PROTOCOL_VIABLE,
+        [0x0d],
+        { uint8: true },
+      );
+      if (sizeResp[0] !== 0x0d) {
+        throw new Error(
+          `Unexpected viable definition_size response: 0x${sizeResp[0]?.toString(16)}`,
+        );
+      }
+      const sizeDv = new DataView(sizeResp.buffer);
+      const payload_size = sizeDv.getUint32(1, true);
+
+      const out = new Uint8Array(payload_size);
+      let offset = 0;
+      const maxChunk = 22;
+
+      while (offset < payload_size) {
+        const want = Math.min(maxChunk, payload_size - offset);
+        const resp = await VialUSB.send(
+          CLIENT_ID_CONSTANTS.PROTOCOL_VIABLE,
+          [0x0e, ...LE16(offset), want],
+          { uint8: true },
+        );
+
+        if (resp[0] !== 0x0e) {
+          throw new Error(
+            `Unexpected viable definition_chunk response: 0x${resp[0]?.toString(16)}`,
+          );
+        }
+        const respOffset = resp[1] | (resp[2] << 8);
+        const actual = resp[3];
+        if (respOffset !== offset) {
+          throw new Error(
+            `Viable definition_chunk offset mismatch (got ${respOffset}, expected ${offset})`,
+          );
+        }
+        out.set(resp.slice(4, 4 + actual), offset);
+        offset += actual;
+        if (actual === 0) {
+          throw new Error("Viable definition_chunk returned 0 bytes");
+        }
+      }
+
+      return out.buffer;
+    };
+
+    let defBuffer;
+    if (USB.useClientIdProtocol && clientIdWrapper.isEnabled()) {
+      defBuffer = await fetchDefinitionViable();
+    } else {
+      defBuffer = await fetchDefinitionVial();
+    }
+
+    const defText = await decompress(defBuffer);
+    const payload = JSON.parse(defText);
     kbinfo.payload = payload;
 
     kbinfo.rows = payload.matrix.rows;
