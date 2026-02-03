@@ -3,6 +3,8 @@
 Develop locally using:
 
 ```
+nix shell nixpkgs#nodejs
+npm install
 npm run compile
 npm run build
 npm start
