@@ -25,3 +25,6 @@ sandbox/
 # Custom scripts
 build.sh
 deploy.sh
+
+# direnv
+.direnv/
